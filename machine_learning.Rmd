@@ -1,0 +1,754 @@
+---
+title: "`r paste0('Anthro: machine learning [', params$model_type, ' model]')`"
+date: "`r Sys.Date()`"
+params:
+  model_type:
+    label: "Type of model"
+    value: temporal
+    input: select
+    choices: [baseline, temporal]
+  n_tune_models:
+    label: "Number of models to tune"
+    value: 5
+    input: select
+    choices: [5, 50, 100, 250, 500]
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 5
+    number_sections: true
+    
+    theme: united
+    highlight: tango
+    code_folding: hide
+    
+    df_print: paged
+    fig_width: 8
+    fig_height: 6
+---
+
+```{r libs}
+# utility
+library(future) # parallel processing tuning
+library(readr)
+library(lubridate)
+library(reshape2) # melt cor
+library(stringr)
+library(forcats)
+
+# machine learning
+library(vip)        # variable importance plots
+library(xgboost)    # random forest
+library(RcppRoll)   # needed for step_window
+library(slider)     # needed for step_roll
+library(tidymodels)
+library(shapviz) # shapley values
+
+# utils
+source("utils.R")
+
+# step_roll
+source("step_roll.R")
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+theme_set(new = theme_bw())
+```
+
+```{r custom_functions}
+# Select columns with *only* NA values, use as all_na_values()
+all_na_values <- function(.x) ~ all(is.na(.x))
+
+population_metrics <- metric_set(mae, rsq, rmse)
+
+get_cust_filename <- function(fname) {
+  str_glue("export/ml_{params$model_type}_{fname}")
+}
+
+ggsave_export <- function(fname, plot = last_plot(), width = NA, height = NA) {
+  fpath <- paste0(get_cust_filename(fname), ".png")
+  
+  ggsave(fpath,
+         plot = plot,
+         width = width,
+         height = height,
+         dpi = 600)
+}
+```
+
+# Load dataset
+
+Dataset loaded from *data/anthro_dataset.csv* (`r file.info("data/anthro_dataset.csv")$mtime`)
+
+```{r load_dataset}
+df_long <- readr::read_csv2(
+  "data/anthro_dataset_full.csv",
+  col_types = cols(
+    country = col_character(),
+    location = col_character(),
+    category = col_character(),
+    date = col_date(format = ""),
+    param = col_character(),
+    predictor = col_double(),
+    population = col_double(),
+    param_fullname = col_character(),
+    param_unit = col_character(),
+    param_label_newl_unit = col_character(),
+    param_label_unit = col_character()
+  )
+) %>%
+  mutate(
+    # sort alphabetically for figures
+    location = factor(location),
+    category = factor(category),
+    
+    param = factor(param),
+    param_fullname = factor(param_fullname),
+    param_unit = factor(param_unit),
+    param_label_newl_unit = factor(param_label_newl_unit),
+    param_label_unit = factor(param_label_unit)
+  )
+```
+
+## Subset to Brussels-Noord
+
+```{r}
+df_long <- df_long %>%
+  filter(location == "Brussel-Noord") %>%
+  select(-country, -location)
+```
+
+## Subset dataset on correct markers
+
+```{r}
+params_to_remove <- filter(df_long, !ml_include)$param_fullname %>% unique() %>% sort()
+```
+
+Following markers will be removed: `r str_c(params_to_remove, collapse = ', ')`
+
+Atenolol is removed manually.
+
+```{r}
+df_long <- df_long %>%
+  filter(ml_include,
+         param != "di_atenolol")
+```
+
+## Following core features are included in the ML model
+
+```{r}
+incl_features <- df_long %>%
+  select(category, param_fullname, param, param_unit) %>%
+  distinct() %>%
+  bind_rows(
+    tibble(
+      category = "Population",
+      param_fullname = "Population (mobile device)",
+      param = "population",
+      param_unit = "number of people"
+    )
+  ) %>%
+  arrange(
+    category, param_fullname
+  ) %>%
+  rename(
+    "Category" = category,
+    "Parameter Name" = param_fullname,
+    "Code" = param,
+    "Unit" = param_unit
+  )
+
+incl_features
+
+# overwritten between baseline and temporal
+write_excel_csv2(incl_features, "export/core_features.csv")
+```
+
+## Wide format
+
+```{r}
+# wide format
+df <- df_long %>%
+  pivot_wider(
+    id_cols = c("date", "population"),
+    names_from = param,
+    values_from = predictor
+  )
+```
+
+# Split dataset
+
+Split 75% to training, 25% to validation, based on date keep x% values
+
+```{r}
+df_subset <- df
+
+set.seed(15684)
+df_split <- initial_time_split(
+  df_subset %>% arrange(date),
+  prop = 0.75
+)
+
+df_training <- training(df_split)
+df_test <- testing(df_split)
+```
+
+## Overview of split
+
+```{r}
+bind_rows(
+  df_training %>% mutate(split = "training"),
+  df_test %>% mutate(split = "testing")
+) %>% 
+  mutate(
+    .by = c("split"),
+    period = paste0(min(date), " - ", max(date))) %>%
+  group_by(period, split, dow = wday(date, week_start = 1, label = T)) %>% 
+  summarise(n = n(),
+            .groups = "drop") %>%
+  pivot_wider(
+    id_cols = c(split, period),
+    names_from = dow,
+    values_from = n
+  )
+```
+
+## Overview of features & split
+
+```{r fig.height = 6, fig.width = 6}
+start_test_dates <- df_test %>%
+  summarise(
+    start_date = min(date)
+  )
+
+ggplot(
+  df_long %>% mutate(location = "Brussel-Noord"),
+  aes(x = date, y = param, colour = category)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_vline(data = start_test_dates, aes(xintercept = start_date, linetype = "training-validation split")) +
+  scale_colour_manual(values = c("Biological" = "#F7786F", "Exogenous" = "#4BCE73", "Hydrochemical" = "#5F9AFF")) +
+  scale_x_date(guide = guide_axis(angle = 40), minor_breaks = "1 month", date_breaks = "3 month") +
+  scale_linetype_manual(name = element_blank(), values = c("training-validation split" = "longdash")) +
+  labs(x = element_blank(),
+       y = element_blank(),
+       colour = element_blank()) +
+  facet_grid(rows = vars(location),
+             scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(legend.position = "bottom")
+
+ggsave_export("features_Brussel-Noord", height = 7, width = 7)
+```
+
+# Preprocess data
+
+## Pairwise correlation
+
+```{r}
+df_cor <- df_training %>%
+  select(where(is.numeric)) %>%
+  select(where(~ !all(is.na(.)))) %>%
+  cor(use = "pairwise.complete.obs", method = "spearman") %>%
+  melt(value.name = "corr")
+
+ggplot(df_cor,
+       aes(x = Var1, y = Var2)) +
+  geom_tile(aes(fill = corr)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_fill_distiller(name = "Cor", palette = "YlOrRd") +
+  labs(title = "Pairwise correlation",
+       x = element_blank(),
+       y = element_blank()) +
+  coord_fixed()
+```
+
+Pairwise correlation \>0.95
+
+```{r}
+df_cor %>% 
+  filter(
+    as.numeric(Var1) < as.numeric(Var2), # select all values of above diagonal
+    corr > 0.95)
+```
+
+# Random forest using (non-imputed) missing data
+
+## RF Recipe
+
+```{r}
+# for step_window names
+window_names <-
+  df_subset %>%
+  select(starts_with(c("di_", "psy_", "hydro_")),
+         -hydro_nitrogen_kjeldahl) %>%
+  names()
+
+rf_recipe_complex <- recipe(population ~ ., data = df_training) %>%
+  step_rm(where(~ all(is.na(.x)))) %>%
+  step_corr(all_numeric_predictors(),
+            use = "pairwise.complete.obs",
+            method = "spearman",
+            threshold = 0.95) %>%
+  step_date(date,
+            features = c("dow", "month"),
+            keep_original_cols = FALSE) %>%
+  # Additional feature engineering, note BEFORE normalize
+  step_lag(all_numeric_predictors(), lag = 1:5) %>%
+  
+  # sliding window
+  step_rolling_mean(all_numeric_predictors(),
+                    -starts_with("lag_"), 
+                    size = 2:5,
+                    role = "predictor") %>%
+  step_dummy(all_factor_predictors()) %>%
+  
+  # Step_dummy creates based on factor levels, also if there are no values
+  # Step_zv is used to remove variables where there is not factor difference
+  step_zv(all_predictors())
+
+rf_recipe_simple <- recipe(population ~ ., data = df_training) %>%
+  step_rm(where(~ all(is.na(.x)))) %>%
+  step_corr(all_numeric_predictors(),
+            use = "pairwise.complete.obs",
+            method = "spearman",
+            threshold = 0.95) %>%
+  step_rm(date) %>%
+  step_dummy(all_factor_predictors()) %>%
+  
+  # Step_dummy creates based on factor levels, also if there are no values
+  # Step_zv is used to remove variables where there is not factor difference
+  step_zv(all_predictors())
+
+if(params$model_type == "baseline") { 
+  rf_recipe <- rf_recipe_simple 
+} else {
+  rf_recipe <- rf_recipe_complex
+}
+```
+
+```{r}
+rf_recipe_norm <- rf_recipe %>%
+  # IMPUTE NOT NEEDED FOR XGBOOST
+  #
+  # "xgboost does not have a means to translate factor predictors to grouped 
+  #  splits. Factor/categorical predictors need to be converted to numeric values
+  #  (e.g., dummy or indicator variables) for this engine"
+  # -------------------------------------------------------------
+  step_normalize(all_numeric_predictors())
+
+rf_recipe_norm
+```
+
+### Final variables..
+
+```{r}
+rf_recipe_norm %>%
+  prep(training = df_training, retain = TRUE) %>%
+  bake(new_data = df_training) %>%
+  str(list.len = 800)
+```
+
+## RF Model with tuning params
+
+Model to tune
+
+```{r}
+rf_model <- boost_tree(
+    trees = tune(),
+    tree_depth = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),
+    sample_size = 1,
+    mtry = tune(),
+    learn_rate = tune()
+  ) %>%
+  set_engine("xgboost",
+             
+             # mtry as counts instead of proportion
+             counts = TRUE) %>%
+  set_mode("regression")
+
+rf_model
+```
+
+The ranges of the parameters that are tuned:
+
+```{r}
+extract_parameter_set_dials(rf_model) %>%
+  mutate(object = print(object))
+```
+
+## RF Workflow
+
+### Train RF Model
+
+Tuning grid, using space filling grid search (DOE)
+
+Tuning \*\*`r params$n_tune_models`
+
+```{r}
+set.seed(15684)
+tune_grid <- grid_space_filling(
+  trees(range = c(10, 1000)),
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  learn_rate(),
+
+  # at least 1 feature, deciding max from df_training
+  finalize(mtry(), df_training),
+
+  # Number of models, lower if takes too long
+  size = as.numeric(params$n_tune_models)
+)
+
+tune_grid
+```
+
+Workflow
+
+```{r}
+# Workflow with tune grid
+rf_wkfl <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(rf_recipe_norm)
+```
+
+Cross-validation
+
+```{r}
+set.seed(165165)
+
+# approx. 75% training, 25% validation
+# 10-fold
+rf_folds <- rolling_origin(
+  initial = 170,
+  assess = 45,
+  skip = 5,
+  df_training,
+  cumulative = FALSE
+)
+```
+
+Using **`r length(rf_folds$splits)`** number of time splits
+
+#### Tuning
+
+> These results are cached. Be very careful here!
+
+```{r tuning_hyperparams, results='hide'}
+tune_cache_name <- str_glue("cache/tunegrid_{params$model_type}_{params$n_tune_models}.rds")
+
+if (file.exists(tune_cache_name)) {
+  print(str_glue("Loading tuneres: {tune_cache_name}!!"))
+  rf_tuneres <- readRDS(tune_cache_name)
+} else {
+  set.seed(89432)
+  
+  rf_tuneres <- tune_grid(
+    rf_wkfl,
+    resamples = rf_folds,
+    grid = tune_grid,
+    metrics = population_metrics,
+    
+    # save predictions
+    control = control_grid(save_pred = T, verbose = T)
+  )
+  
+  print(str_glue("Caching cached tuneres as {tune_cache_name}.."))
+  saveRDS(rf_tuneres, tune_cache_name)
+}
+```
+
+#### Tuning results
+
+```{r}
+rf_tuneres %>% 
+  collect_metrics() %>%
+  filter(.metric == "rsq") %>%
+  pivot_longer(mtry:loss_reduction,
+               names_to = "hyperparam",
+               values_to = "value") %>%
+  # to xgboost param!
+  mutate(
+    hyperparam = case_when(
+      hyperparam == "learn_rate" ~ "eta",
+      hyperparam == "loss_reduction" ~ "gamma",
+      hyperparam == "min_n" ~ "min_child_weight",
+      hyperparam == "mtry" ~ "colsample_bytree",
+      hyperparam == "tree_depth" ~ "max_depth",
+      hyperparam == "trees" ~ "Nrounds",
+      T ~ "unknown"
+    )
+  ) %>%
+  ggplot(aes(x = value, y = mean)) +
+  geom_point(show.legend = FALSE) +
+  labs(x = element_blank(),
+       y = "Mean R²") +
+  facet_wrap(vars(hyperparam),
+             scales = "free_x")
+
+ggsave_export("tuning_hyperparam_results", width = 9, height = 4)
+```
+
+Best results (cave space filling grid search)
+
+```{r}
+show_best(rf_tuneres, metric = "rsq")
+```
+
+Final workflow
+
+```{r}
+best_rsq <- select_best(rf_tuneres, metric = "rsq")
+
+rf_final <- finalize_workflow(rf_wkfl, best_rsq)
+
+# final model
+final_res <- last_fit(rf_final, df_split)
+
+rf_final
+```
+
+#### Hyperparameters final of **`r params$model_type`** model
+
+```{r}
+tuned_params <- rf_final %>%
+  extract_spec_parsnip() %>% .$args %>% lapply(rlang::eval_tidy)
+
+tuned_params
+
+tibble(
+  hyperparam = names(unlist(tuned_params)),
+  value = unlist(tuned_params)
+) %>%
+  # to xgboost param!
+  mutate(
+    param = case_when(
+      hyperparam == "learn_rate" ~ "eta",
+      hyperparam == "loss_reduction" ~ "gamma",
+      hyperparam == "min_n" ~ "min_child_weight",
+      hyperparam == "mtry" ~ "colsample_bytree",
+      hyperparam == "tree_depth" ~ "max_depth",
+      hyperparam == "trees" ~ "Nrounds",
+      T ~ "unknown"
+    )
+  )
+```
+
+### Evaluate on training & test set
+
+#### Final metrics
+
+##### Training set fit
+
+```{r}
+get_finalres_rsq <- function(.final_res_fit) {
+  .final_res_fit %>%
+    filter(.metric == "rsq") %>% # Filter for the rsq row
+    pull(.estimate)  %>%
+    round(digits = 2)
+}
+
+final_res_trainingfit <- final_res %>% 
+  extract_workflow() %>%
+  augment(df_training) %>%
+  population_metrics(truth = population,
+                     estimate = .pred)
+
+final_res_trainingfit
+```
+
+##### Validation set fit
+
+```{r}
+final_res_validationfit <- final_res %>% collect_metrics()
+
+final_res_validationfit
+```
+
+Additional metrics
+
+-   MAE, mean absolute error
+
+    -   average of the absolute differences between predicted and actual population values (pop scale)
+
+    -   e.g., on average prediction is off by X people
+
+-   MAPE, mean absolute percentage error
+
+-   MBE, mean bias error
+
+    -   Consistent over/underestimation of model (pop scale)
+
+-   MBPE, mean bias percentage error
+
+-   treshold_accX, threshold accuracy
+
+    -   Percentage of values predicted within X% accuracy from the actual value
+
+```{r}
+# Calculate additional metrics (MAE, Bias)
+final_res %>%
+  collect_predictions() %>%
+  mutate(
+    accuracy = .pred / population * 100
+  ) %>%
+  summarise(
+    mae = mean(abs(.pred - population)),             # Mean Absolute Error
+    mape = mean(abs((.pred - population) / population) * 100),  # Mean Absolute Percentage Error
+    
+    mbe = mean(.pred - population),                 # Mean Bias Error
+    mbpe = mean((.pred - population) / population * 100),
+        
+    # treshhold accuracy = num within X% / total
+    treshold_acc10 = sum(abs(100 - accuracy) <= 10) / n() * 100,
+    treshold_acc15 = sum(abs(100 - accuracy) <= 15) / n() * 100,
+    treshold_acc20 = sum(abs(100 - accuracy) <= 20) / n() * 100
+  )
+```
+
+**So final fit for best model (R²): training (R² = `r get_finalres_rsq(final_res_trainingfit)`) vs validation (R² = `r get_finalres_rsq(final_res_validationfit)`)**
+
+#### Predictions on training/validation set
+
+```{r}
+final_predictions <- bind_rows(
+  final_res %>% 
+    extract_workflow() %>%
+    augment(new_data = df_training) %>%
+    mutate(type = "training"),
+  final_res %>% 
+    extract_workflow() %>%
+    augment(df_test) %>%
+    mutate(type = "validation")
+)
+
+final_predictions %>%
+  group_by(type) %>%
+  summarise(
+    n = n(),
+    min = min(population),
+    max = max(population),
+    mean = mean(population)
+  )
+```
+
+Scatter plot actual vs predicted
+
+```{r fig.width = 8, fig.height = 5}
+final_predictions %>%
+  ggplot(aes(x = population, y = .pred)) +
+  geom_point() +
+  labs(x = "Actual population",
+       y = "Predicted population",
+       title = str_to_sentence(paste0(params$model_type, " model"))) +
+  facet_grid(cols = vars(type))
+  
+ggsave_export("scatter_prediction", width = 8, height = 5)
+```
+
+Scatter plot error residuals
+
+```{r fig.width = 8, fig.height = 5}
+final_predictions %>%
+  ggplot(aes(x = population, y = .pred - population)) +
+  geom_hline(yintercept = 0) +
+  geom_point() +
+  labs(x = "Actual population",
+       y = "Predicted - Actual (error resid population)",
+       title = str_to_sentence(paste0(params$model_type, " model"))) +
+  facet_grid(cols = vars(type))
+  
+ggsave_export("scatter_prediction_resid", width = 8, height = 5)
+```
+
+Model performance over time
+
+```{r fig.width = 8, fig.height = 5}
+final_predictions %>%
+  # only predict population for validation set
+  mutate(actual_population = population,
+         pred_population = if_else(type == "training", population, .pred)) %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = .pred / 1000, linetype = "predicted population"), alpha = 0.5) +
+  geom_point(aes(y = population / 1000, shape = "actual population", colour = type)) +
+  labs(x = element_blank(),
+       y = "Population (x1000)",
+       title = str_to_sentence(paste0(params$model_type, " model")),
+       type = "dataset",
+       colour = "Dataset",
+       linetype = element_blank(),
+       shape = element_blank())
+
+ggsave_export("actual_vs_pred_scatterline", width = 8, height = 5)
+```
+
+## Feature importance (final model)
+
+### Variable importance plots
+
+```{r}
+rf_final %>%
+  fit(data = df_training) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")
+```
+
+### Shapviz (validation data)
+
+```{r}
+# normalised, model-fed, scale
+shap_X_pred <- bake(
+    prep(rf_recipe_norm),
+    has_role("predictor"),
+    new_data = df_test,
+    composition = "matrix"
+)
+
+# original scale
+shap_X <- bake(
+    prep(rf_recipe),
+    has_role("predictor"),
+    new_data = df_test
+)
+
+setdiff(colnames(shap_X), colnames(shap_X_pred))
+setdiff(colnames(shap_X_pred), colnames(shap_X))
+
+# You might want to subset e.g., new_data = df_training[1:1000, ]
+# df_shap_explain <- df_training[1:1000, ]
+shap_values <- shapviz(
+  extract_fit_engine(final_res),
+  X_pred = shap_X_pred,
+  X = shap_X
+)
+```
+
+Importance plot
+
+```{r fig.width = 6, fig.height = 3}
+shap_values %>%
+  sv_importance(show_numbers = TRUE) +
+  labs(title = str_to_sentence(paste0(params$model_type, " model")))
+
+ggsave_export("SHAP_importance_numbers", width = 6, height = 3)
+
+shap_values %>%
+  sv_importance(show_numbers = TRUE)%>%
+  .$data %>%
+  write_excel_csv2(
+    file = get_cust_filename("SHAP_importance.csv")
+  )
+```
+
+```{r fig.width=6, fig.height = 3}
+shap_values %>%
+  sv_importance(kind = "beeswarm", show_numbers = TRUE) +
+    labs(title = str_to_sentence(paste0(params$model_type, " model")))
+
+ggsave_export("SHAP_importance_beeswarm", width = 6, height = 3)
+```
